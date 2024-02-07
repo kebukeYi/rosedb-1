@@ -8,8 +8,11 @@ import (
 	"os"
 	"path/filepath"
 	"sync/atomic"
+	"time"
 
+	"github.com/rosedblabs/rosedb/v2/index"
 	"github.com/rosedblabs/wal"
+	"github.com/valyala/bytebufferpool"
 )
 
 const (
@@ -23,7 +26,45 @@ const (
 //
 // Merge operation maybe a very time-consuming operation when the database is large.
 // So it is recommended to perform this operation when the database is idle.
-func (db *DB) Merge() error {
+//
+// If reopenAfterDone is true, the original file will be replaced by the merge file,
+// and db's index will be rebuilt after the merge completes.
+func (db *DB) Merge(reopenAfterDone bool) error {
+	if err := db.doMerge(); err != nil {
+		return err
+	}
+	if !reopenAfterDone {
+		return nil
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	// close current files
+	_ = db.closeFiles()
+
+	// replace original file
+	err := loadMergeFiles(db.options.DirPath)
+	if err != nil {
+		return err
+	}
+
+	// open data files
+	if db.dataFiles, err = db.openWalFiles(); err != nil {
+		return err
+	}
+
+	// discard the old index first.
+	db.index = index.NewIndexer()
+	// rebuild index
+	if err = db.loadIndex(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (db *DB) doMerge() error {
 	db.mu.Lock()
 	// check if the database is closed
 	if db.closed {
@@ -49,6 +90,7 @@ func (db *DB) Merge() error {
 	// rotate the write-ahead log, create a new active segment file.
 	// so all the older segment files will be merged.
 	if err := db.dataFiles.OpenNewActiveSegment(); err != nil {
+		db.mu.Unlock()
 		return err
 	}
 
@@ -67,9 +109,14 @@ func (db *DB) Merge() error {
 		_ = mergeDB.Close()
 	}()
 
+	buf := bytebufferpool.Get()
+	now := time.Now().UnixNano()
+	defer bytebufferpool.Put(buf)
+
 	// iterate all the data files, and write the valid data to the new data file.
 	reader := db.dataFiles.NewReaderWithMax(prevActiveSegId)
 	for {
+		buf.Reset()
 		chunk, position, err := reader.Next()
 		if err != nil {
 			if err == io.EOF {
@@ -80,21 +127,23 @@ func (db *DB) Merge() error {
 		record := decodeLogRecord(chunk)
 		// Only handle the normal log record, LogRecordDeleted and LogRecordBatchFinished
 		// will be ignored, because they are not valid data.
-		if record.Type == LogRecordNormal {
+		if record.Type == LogRecordNormal && (record.Expire == 0 || record.Expire > now) {
+			db.mu.RLock()
 			indexPos := db.index.Get(record.Key)
+			db.mu.RUnlock()
 			if indexPos != nil && positionEquals(indexPos, position) {
 				// clear the batch id of the record,
 				// all data after merge will be valid data, so the batch id should be 0.
 				record.BatchId = mergeFinishedBatchID
 				// Since the mergeDB will never be used for any read or write operations,
 				// it is not necessary to update the index.
-				newPosition, err := mergeDB.dataFiles.Write(encodeLogRecord(record))
+				newPosition, err := mergeDB.dataFiles.Write(encodeLogRecord(record, mergeDB.encodeHeader, buf))
 				if err != nil {
 					return err
 				}
-				// And now we should write the new posistion to the write-ahead log,
+				// And now we should write the new position to the write-ahead log,
 				// which is so-called HINT FILE in bitcask paper.
-				// The HINT FILE will be used to rebuild the index fastly when the database is restarted.
+				// The HINT FILE will be used to rebuild the index quickly when the database is restarted.
 				_, err = mergeDB.hintFile.Write(encodeHintRecord(record.Key, newPosition))
 				if err != nil {
 					return err
@@ -143,11 +192,11 @@ func (db *DB) openMergeDB() (*DB, error) {
 	hintFile, err := wal.Open(wal.Options{
 		DirPath: options.DirPath,
 		// we don't need to rotate the hint file, just write all data to a single file.
-		SegmentSize:   math.MaxInt64,
-		SementFileExt: hintFileNameSuffix,
-		Sync:          false,
-		BytesPerSync:  0,
-		BlockCache:    0,
+		SegmentSize:    math.MaxInt64,
+		SegmentFileExt: hintFileNameSuffix,
+		Sync:           false,
+		BytesPerSync:   0,
+		BlockCache:     0,
 	})
 	if err != nil {
 		return nil, err
@@ -164,12 +213,12 @@ func mergeDirPath(dirPath string) string {
 
 func (db *DB) openMergeFinishedFile() (*wal.WAL, error) {
 	return wal.Open(wal.Options{
-		DirPath:       db.options.DirPath,
-		SegmentSize:   GB,
-		SementFileExt: mergeFinNameSuffix,
-		Sync:          false,
-		BytesPerSync:  0,
-		BlockCache:    0,
+		DirPath:        db.options.DirPath,
+		SegmentSize:    GB,
+		SegmentFileExt: mergeFinNameSuffix,
+		Sync:           false,
+		BytesPerSync:   0,
+		BlockCache:     0,
 	})
 }
 
@@ -184,40 +233,40 @@ func encodeHintRecord(key []byte, pos *wal.ChunkPosition) []byte {
 	//    5          5           10          5      =    25
 	// see binary.MaxVarintLen64 and binary.MaxVarintLen32
 	buf := make([]byte, 25)
-	var index = 0
+	var idx = 0
 
 	// SegmentId
-	index += binary.PutUvarint(buf[index:], uint64(pos.SegmentId))
+	idx += binary.PutUvarint(buf[idx:], uint64(pos.SegmentId))
 	// BlockNumber
-	index += binary.PutUvarint(buf[index:], uint64(pos.BlockNumber))
+	idx += binary.PutUvarint(buf[idx:], uint64(pos.BlockNumber))
 	// ChunkOffset
-	index += binary.PutUvarint(buf[index:], uint64(pos.ChunkOffset))
+	idx += binary.PutUvarint(buf[idx:], uint64(pos.ChunkOffset))
 	// ChunkSize
-	index += binary.PutUvarint(buf[index:], uint64(pos.ChunkSize))
+	idx += binary.PutUvarint(buf[idx:], uint64(pos.ChunkSize))
 
 	// key
-	result := make([]byte, index+len(key))
-	copy(result, buf[:index])
-	copy(result[index:], key)
+	result := make([]byte, idx+len(key))
+	copy(result, buf[:idx])
+	copy(result[idx:], key)
 	return result
 }
 
 func decodeHintRecord(buf []byte) ([]byte, *wal.ChunkPosition) {
-	var index = 0
+	var idx = 0
 	// SegmentId
-	segmentId, n := binary.Uvarint(buf[index:])
-	index += n
+	segmentId, n := binary.Uvarint(buf[idx:])
+	idx += n
 	// BlockNumber
-	blockNumber, n := binary.Uvarint(buf[index:])
-	index += n
+	blockNumber, n := binary.Uvarint(buf[idx:])
+	idx += n
 	// ChunkOffset
-	chunkOffset, n := binary.Uvarint(buf[index:])
-	index += n
+	chunkOffset, n := binary.Uvarint(buf[idx:])
+	idx += n
 	// ChunkSize
-	chunkSize, n := binary.Uvarint(buf[index:])
-	index += n
+	chunkSize, n := binary.Uvarint(buf[idx:])
+	idx += n
 	// Key
-	key := buf[index:]
+	key := buf[idx:]
 
 	return key, &wal.ChunkPosition{
 		SegmentId:   wal.SegmentID(segmentId),
@@ -240,7 +289,10 @@ func loadMergeFiles(dirPath string) error {
 	mergeDirPath := mergeDirPath(dirPath)
 	if _, err := os.Stat(mergeDirPath); err != nil {
 		// does not exist, just return.
-		return nil
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
 	}
 
 	// remove the merge directory at last
@@ -248,7 +300,7 @@ func loadMergeFiles(dirPath string) error {
 		_ = os.RemoveAll(mergeDirPath)
 	}()
 
-	copyFile := func(suffix string, fileId uint32) {
+	copyFile := func(suffix string, fileId uint32, force bool) {
 		srcFile := wal.SegmentFileName(mergeDirPath, suffix, fileId)
 		stat, err := os.Stat(srcFile)
 		if os.IsNotExist(err) {
@@ -257,7 +309,7 @@ func loadMergeFiles(dirPath string) error {
 		if err != nil {
 			panic(fmt.Sprintf("loadMergeFiles: failed to get src file stat %v", err))
 		}
-		if stat.Size() == 0 {
+		if !force && stat.Size() == 0 {
 			return
 		}
 		destFile := wal.SegmentFileName(dirPath, suffix, fileId)
@@ -273,19 +325,30 @@ func loadMergeFiles(dirPath string) error {
 	// should be moved to the original data directory, and the original data files should be deleted.
 	for fileId := uint32(1); fileId <= mergeFinSegmentId; fileId++ {
 		destFile := wal.SegmentFileName(dirPath, dataFileNameSuffix, fileId)
+		// will have bug here if continue, check it later.todo
+
+		// If we call Merge multiple times, some segment files will be deleted earlier, so just skip them.
+		// if _, err = os.Stat(destFile); os.IsNotExist(err) {
+		// 	continue
+		// } else if err != nil {
+		// 	return err
+		// }
+
 		// remove the original data file
-		if err = os.Remove(destFile); err != nil {
-			return err
+		if _, err = os.Stat(destFile); err == nil {
+			if err = os.Remove(destFile); err != nil {
+				return err
+			}
 		}
 		// move the merge data file to the original data directory
-		copyFile(dataFileNameSuffix, fileId)
+		copyFile(dataFileNameSuffix, fileId, false)
 	}
 
 	// copy MERGEFINISHED and HINT files to the original data directory
 	// there is only one merge finished file, so the file id is always 1,
 	// the same as the hint file.
-	copyFile(mergeFinNameSuffix, 1)
-	copyFile(hintFileNameSuffix, 1)
+	copyFile(mergeFinNameSuffix, 1, true)
+	copyFile(hintFileNameSuffix, 1, true)
 
 	return nil
 }
@@ -316,9 +379,9 @@ func (db *DB) loadIndexFromHintFile() error {
 	hintFile, err := wal.Open(wal.Options{
 		DirPath: db.options.DirPath,
 		// we don't need to rotate the hint file, just write all data to the same file.
-		SegmentSize:   math.MaxInt64,
-		SementFileExt: hintFileNameSuffix,
-		BlockCache:    32 * KB * 10,
+		SegmentSize:    math.MaxInt64,
+		SegmentFileExt: hintFileNameSuffix,
+		BlockCache:     32 * KB * 10,
 	})
 	if err != nil {
 		return err

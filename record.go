@@ -2,8 +2,8 @@ package rosedb
 
 import (
 	"encoding/binary"
-
 	"github.com/rosedblabs/wal"
+	"github.com/valyala/bytebufferpool"
 )
 
 // LogRecordType is the type of the log record.
@@ -18,10 +18,10 @@ const (
 	LogRecordBatchFinished
 )
 
-// type batchId keySize valueSize
+// type batchId keySize valueSize expire
 //
-//	1  +  10  +   5   +   5 = 21
-const maxLogRecordHeaderSize = binary.MaxVarintLen32*2 + binary.MaxVarintLen64 + 1
+//	1  +  10  +   5   +   5   +    10  = 31
+const maxLogRecordHeaderSize = binary.MaxVarintLen32*2 + binary.MaxVarintLen64*2 + 1
 
 // LogRecord is the log record of the key/value pair.
 // It contains the key, the value, the record type and the batch id
@@ -31,6 +31,12 @@ type LogRecord struct {
 	Value   []byte
 	Type    LogRecordType
 	BatchId uint64
+	Expire  int64
+}
+
+// IsExpired checks whether the log record is expired.
+func (lr *LogRecord) IsExpired(now int64) bool {
+	return lr.Expire > 0 && lr.Expire <= now
 }
 
 // IndexRecord is the index record of the key.
@@ -42,14 +48,12 @@ type IndexRecord struct {
 	position   *wal.ChunkPosition
 }
 
-// +-------------+-------------+-------------+--------------+-------------+--------------+
-// |    type     |  batch id   |   key size  |   value size |      key    |      value   |
-// +-------------+-------------+-------------+--------------+-------------+--------------+
+// +-------------+-------------+-------------+--------------+---------------+---------+--------------+
+// |    type     |  batch id   |   key size  |   value size |     expire    |  key    |      value   |
+// +-------------+-------------+-------------+--------------+---------------+--------+--------------+
 //
-//	1 byte	      varint(max 10) varint(max 5)  varint(max 5)     varint		varint
-func encodeLogRecord(logRecord *LogRecord) []byte {
-	header := make([]byte, maxLogRecordHeaderSize)
-
+//	1 byte	      varint(max 10) varint(max 5)  varint(max 5) varint(max 10)  varint      varint
+func encodeLogRecord(logRecord *LogRecord, header []byte, buf *bytebufferpool.ByteBuffer) []byte {
 	header[0] = logRecord.Type
 	var index = 1
 
@@ -59,18 +63,17 @@ func encodeLogRecord(logRecord *LogRecord) []byte {
 	index += binary.PutVarint(header[index:], int64(len(logRecord.Key)))
 	// value size
 	index += binary.PutVarint(header[index:], int64(len(logRecord.Value)))
-
-	var size = index + len(logRecord.Key) + len(logRecord.Value)
-	encBytes := make([]byte, size)
+	// expire
+	index += binary.PutVarint(header[index:], logRecord.Expire)
 
 	// copy header
-	copy(encBytes[:index], header[:index])
+	_, _ = buf.Write(header[:index])
 	// copy key
-	copy(encBytes[index:], logRecord.Key)
+	_, _ = buf.Write(logRecord.Key)
 	// copy value
-	copy(encBytes[index+len(logRecord.Key):], logRecord.Value)
+	_, _ = buf.Write(logRecord.Value)
 
-	return encBytes
+	return buf.Bytes()
 }
 
 // decodeLogRecord decodes the log record from the given byte slice.
@@ -90,6 +93,10 @@ func decodeLogRecord(buf []byte) *LogRecord {
 	valueSize, n := binary.Varint(buf[index:])
 	index += uint32(n)
 
+	// expire
+	expire, n := binary.Varint(buf[index:])
+	index += uint32(n)
+
 	// copy key
 	key := make([]byte, keySize)
 	copy(key[:], buf[index:index+uint32(keySize)])
@@ -99,6 +106,6 @@ func decodeLogRecord(buf []byte) *LogRecord {
 	value := make([]byte, valueSize)
 	copy(value[:], buf[index:index+uint32(valueSize)])
 
-	return &LogRecord{Key: key, Value: value,
+	return &LogRecord{Key: key, Value: value, Expire: expire,
 		BatchId: batchId, Type: recordType}
 }

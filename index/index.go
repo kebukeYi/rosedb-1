@@ -19,58 +19,44 @@ type Indexer interface {
 	// Size represents the number of keys in the index.
 	Size() int
 
-	// Iterator returns an iterator for the index.
-	Iterator(options IteratorOptions) Iterator
-}
+	// Ascend iterates over items in ascending order and invokes the handler function for each item.
+	// If the handler function returns false, iteration stops.
+	Ascend(handleFn func(key []byte, position *wal.ChunkPosition) (bool, error))
 
-// Iterator is an interface for iterating the index.
-type Iterator interface {
-	// Rewind seek the first key in the index iterator.
-	Rewind()
+	// AscendRange iterates in ascending order within [startKey, endKey], invoking handleFn.
+	// Stops if handleFn returns false.
+	AscendRange(startKey, endKey []byte, handleFn func(key []byte, position *wal.ChunkPosition) (bool, error))
 
-	// Seek move the iterator to the key which is
-	// greater(less when reverse is true) than or equal to the specified key.
-	Seek(key []byte)
+	// AscendGreaterOrEqual iterates in ascending order, starting from key >= given key,
+	// invoking handleFn. Stops if handleFn returns false.
+	AscendGreaterOrEqual(key []byte, handleFn func(key []byte, position *wal.ChunkPosition) (bool, error))
 
-	// Next moves the iterator to the next key.
-	Next()
+	// Descend iterates over items in descending order and invokes the handler function for each item.
+	// If the handler function returns false, iteration stops.
+	Descend(handleFn func(key []byte, pos *wal.ChunkPosition) (bool, error))
 
-	// Key get the current key.
-	Key() []byte
+	// DescendRange iterates in descending order within [startKey, endKey], invoking handleFn.
+	// Stops if handleFn returns false.
+	DescendRange(startKey, endKey []byte, handleFn func(key []byte, position *wal.ChunkPosition) (bool, error))
 
-	// Value get the current value.
-	Value() *wal.ChunkPosition
-
-	// Valid returns whether the iterator is exhausted.
-	Valid() bool
-
-	// Close the iterator.
-	Close()
-}
-
-// IteratorOptions is the options for the iterator.
-type IteratorOptions struct {
-	// Prefix filters the keys by prefix.
-	Prefix []byte
-
-	// Reverse indicates whether the iterator is reversed.
-	// false is forward, true is backward.
-	Reverse bool
+	// DescendLessOrEqual iterates in descending order, starting from key <= given key,
+	// invoking handleFn. Stops if handleFn returns false.
+	DescendLessOrEqual(key []byte, handleFn func(key []byte, position *wal.ChunkPosition) (bool, error))
 }
 
 type IndexerType = byte
 
 const (
-	RadixTree IndexerType = iota
+	BTree IndexerType = iota
 )
 
 // Change the index type as you implement.
-var indexType = RadixTree
+var indexType = BTree
 
 func NewIndexer() Indexer {
 	switch indexType {
-	case RadixTree:
-		return newRadixTree()
+	case BTree:
+		return newBTree()
 	default:
 		panic("unexpected index type")
 	}
